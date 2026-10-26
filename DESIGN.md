@@ -195,6 +195,7 @@ flowchart LR
 | Vuln correlation | Matches package inventory to distro advisories | OSV, CSAF/VEX, OVAL feeds |
 | Signals service | Sends compliance changes to IdPs; Intune bridge | OpenID SSF/CAEP transmitter |
 | Audit + transparency log | Append-only log of every policy version and action; Merkle proofs | Trillian/Rekor-style |
+| Evidence log | Second transparency log (`corp-evidence`) on the payload log's infrastructure; salted evidence commitments with separate retention/privacy rules. Devices never need inclusion proofs for it | Same log infrastructure; `AuditEvidence` in the MAM supplement |
 | Escrow vault | LUKS recovery keys, LAPS credentials; envelope-encrypted, access audited | Vault / KMS |
 
 Self-hosted and SaaS deployments use the same components. The reference server ships as a single binary plus Postgres for small sites (under 5k devices).
@@ -782,6 +783,10 @@ TUF-style roles per tenant:
 
 **Convenience mode** (admin keys held by the server, single signer) exists for small organisations. It is **labelled loudly**, and the device record shows `signing_mode: server-held` to relying parties.
 
+**Witness co-signing:** at least two independent witnesses (foundation, peer tenants or public Sigsum-style witnesses) verify append-only consistency and co-sign log checkpoints every N minutes, with N fixed by deployment policy, using C2SP checkpoint/cosignature formats. Investigators reject checkpoints without the required witness co-signatures. With an honest independent witness quorum, this closes single-operator history rewriting and split-view attacks; a tenant operator's signature alone is insufficient.
+
+**Checkpoint anchor interface (`AuditEvidence`, pluggable):** input = signed checkpoint hash; output = offline-verifiable proof. The default backend stamps the latest witness co-signed checkpoint hourly through **OpenTimestamps** public Bitcoin calendars ($0, no account); completed proofs verify against Bitcoin block headers and can take hours to become available. A tenant MAY plug in Hedera HCS or an Ethereum L2; the protocol depends on no specific ledger or token. Only Merkle roots are anchored externally, never records or identifiers. Anchor on a fixed schedule regardless of volume, preferably one aggregate root across all tenants to avoid leaking tenant usage patterns. Per-event ledger anchoring is explicitly rejected on cost/operations grounds: at the advisory's reference scale of 1M events/day (30M/month), its illustrative fee of $0.0001/event is about $3k/month plus token/account operations, versus $0 for batched OpenTimestamps.
+
 ### 10.4 Server compromise blast radius
 
 | Attacker controls | Can do | Cannot do (when admin signing is enforced) |
@@ -790,6 +795,8 @@ TUF-style roles per tenant:
 | One admin's hardware key | Whatever that admin can sign alone under the thresholds | Multi-party actions; acting secretly (transparency log) |
 | Escrow vault | Recovery keys → unlock stolen disks | Use them remotely. Physical access is still needed. Escrow is envelope-encrypted with access logged and alerting on bulk reads. |
 | CA | Mint device certs → impersonate devices to the IdP | Get past TPM attestation checks at IdPs requiring `tpm-measured`; mis-issuance is visible in the CT-style log |
+
+Witness co-signed checkpoints plus external anchors make post-leak rewriting/deletion of committed watermark mappings detectable and support commit-before-leak evidence. This is **deterrence and forensics, not prevention**: anchoring protects trail integrity, not the truth of a record or attribution itself. A rogue admin acting at render time remains a risk; deterministic watermark IDs bound to instance-signed requests limit framing (see the supplement). Anchoring gaps degrade evidence only, never access: continue logging locally, anchor later and retain visible gaps. Witness co-signatures cover the interval before a timestamp proof completes, but do not supply an external timestamp.
 
 ### 10.5 Privacy boundaries (BYOD "never" list, enforced on the device)
 
@@ -826,6 +833,7 @@ Enforcement:
 | Tenant code surveys personal LAN/host | Owner-controlled LAN/link-local/loopback floor, `/sys` and `/proc` masking, brokered devices, verdict-only reporting | Owner exceptions weaken protection; shared kernel/permitted traffic retain fingerprinting and covert-channel risk. |
 | Device tenant vs. co-resident workspace tenant | Local-only workspace allowlist; consented anonymous host-authority signal; encrypted locked volumes | Root core compromise or T2 root authority exposes unlocked co-resident data; measured boot does not remove this TCB. |
 | Screen photography or capture leak | Optional server-side forensic/visible watermark; audit | Deters and traces only; root or compositor can capture before the mark is applied; marks can be forged if keys leak |
+| Evidence-trail tampering: rogue admin rewrites/deletes watermark mappings after a leak | Witness co-signed checkpoints + external anchors make changes to committed history detectable | Rogue admin acting at render time remains a risk; mitigate with deterministic watermark IDs bound to client-signed requests. Anchors protect trail integrity, not attribution; a mark is never sole evidence. |
 
 ---
 
@@ -1096,3 +1104,4 @@ These choices come before any code. Each has my recommendation.
 | 19 | **Multi-identity scope** | Multiple resource tenants in one app; one per workspace | **One resource tenant per app/workspace in v1.** Multiple definitions per (human, tenant) are allowed; cross-tenant identity sharing is deferred. |
 | 20 | **Where DLP is enforced** | Local-only controls; combined remote and local gates | **IdP token/audience rules and key-broker leases gate access; workspace mediates cooperative flows.** No screenshot/input guarantee against a compromised compositor or host. |
 | 21 | **Assurance axis vs tier** | Enrollment implies trust; independent axes | **Authority tier ≠ capability ≠ evidence.** Workspace `assurance` and device `trust_level` remain separate; measurement never raises T0 authority or live-data ceiling. |
+| 22 | **Leak-attribution evidence anchoring** | Existing log infrastructure + witnesses + OpenTimestamps; ledger-specific evidence system | **Reuse transparency-log infrastructure with a separate evidence log, witness co-signing and OpenTimestamps anchoring.** $0 anchoring, no token dependency. Public ledgers (Hedera HCS, Ethereum L2 etc.) are optional pluggable anchors only. Ledger anchoring protects trail integrity, not attribution itself; per-event anchoring is rejected on cost/operations grounds (§10.3). |
