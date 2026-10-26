@@ -54,10 +54,8 @@ Every Linux management tool today has its own enrollment, agent and control chan
 5. **The device enforces its own limits.** Each enrollment has a *capability ceiling* agreed at enrollment and stored on the device. No server compromise can exceed it.
 6. **BYOD-respecting.** Personal devices get scoped management, with a published list of what may never be collected. The user can see every query and action locally.
 7. **Offline-tolerant.** Laptops are offline a lot. Policy is evaluated locally, results queue, and lease-based fallbacks need no connectivity.
-8. **Immutable workspaces always; immutable hosts first-class.** Tenant workspace apps ship as signed, digest-pinned images with ephemeral writable app state and encrypted persistent data. Image-based hosts (Fedora Atomic/bootc, openSUSE Aeon/MicroOS, Ubuntu Core, NixOS) remain first-class targets; workspace immutability does not imply host integrity. OCI workspaces are an app delivery option alongside §7.2.
+8. **Immutable tenant-shipped OCI workspaces; immutable hosts first-class.** Tenant-shipped OCI workspace apps ship as signed, digest-pinned images with ephemeral writable app state and encrypted persistent data; the §7.2 and §9.2 delivery models keep their own persistence rules. Image-based hosts (Fedora Atomic/bootc, openSUSE Aeon/MicroOS, Ubuntu Core, NixOS) remain first-class targets; workspace immutability does not imply host integrity. OCI workspaces are an app delivery option alongside §7.2.
 9. **Honest compliance.** A compliance report is a claim by the device. The protocol records *how much* it is attested (software key, TPM key, measured boot), so relying parties can choose the trust level they need.
-
----
 
 ### 2.1 Authority tiers
 
@@ -186,7 +184,7 @@ flowchart LR
 | Device directory | Device records, ownership mode, groups, lifecycle state, capability ceiling | Postgres |
 | Workspace registry | T0/T1/T2 workspace instances, registered user/tenant keys and workspace-only ceilings; separate from device enrollment | **[NEW]**, proposed MAM supplement |
 | Workspace key broker / verifier | Bounded instance-volume leases; policy/evidence evaluation; independent instance KEKs wrapped by tenant KMS keys | **[NEW]**, KMS/HSM + signed reference-policy verification |
-| Evidence broker interface | Consented, fixed-verdict host evidence via owner-controlled TRP-Attested broker (A-BRK-01); no arbitrary tenant queries or raw event-log transmission for T0 | **[NEW]**, local broker + remote verifier |
+| Evidence broker interface | Consented, fixed-verdict host evidence via owner-controlled TRP-Attested broker (A-BRK-01); no arbitrary tenant queries or raw event-log transmission | **[NEW]**, local broker + remote verifier |
 | Policy store | Source of truth for policy; GitOps-friendly YAML; versioned | git + Postgres (Fleet-style GitOps) |
 | Policy compiler | Resolves targeting, rings and conflicts into a per-device *declaration set*; content-addressed | **[NEW]** |
 | Signing service | Signs declaration manifests with *online* delegated keys. High-risk payloads need admin signatures (§10) | KMS/HSM + TUF-style delegation |
@@ -728,7 +726,7 @@ The [proposed MAM supplement](docs/workspace-capability-mam.md) develops the roo
 
 ### 9.2 Recommendation
 
-The separate work-user model below uses a **separate seat session with its own compositor**, reached by fast user switching. It is stronger for display/input than the supplement's bridged model. T0 and T1 may use that proposed bridge for ordinary internal data only when policy accepts personal-compositor compromise risk; on T0, anything above ordinary internal requires the separate seat and an explicit policy, while the supplement's forbidden classes remain excluded entirely. T1 may choose either model under its enrolled policy; bridging does not inherit separate-seat strength. See the [supplement](docs/workspace-capability-mam.md#purpose-and-limits) for these limits.
+The separate work-user model below uses a **separate seat session with its own compositor**, reached by fast user switching. It is stronger for display/input than the supplement's bridged model. T0 and T1 may use that proposed bridge for ordinary internal data only when policy accepts personal-compositor compromise risk; on T0, anything above ordinary internal requires the separate seat and an explicit policy, while the supplement's forbidden classes remain excluded entirely. On T1 the same compositor risk applies: the bridge is limited to ordinary internal data, and anything above it requires the separate seat under the enrolled policy; bridging does not inherit separate-seat strength. See the [supplement](docs/workspace-capability-mam.md#purpose-and-limits) for these limits.
 
 **BYOD = "work account on a personal device":**
 1. Enrollment creates a **work user** via `systemd-homed` (LUKS2 home, password/FIDO2 unlock, an identity record carrying `tuxherd.tenant`). Where homed isn't available, a regular user with **fscrypt**-encrypted home is the fallback (weaker metadata protection, still crypto-shreddable).
@@ -765,6 +763,7 @@ TUF-style roles per tenant:
 | `root` | Offline / threshold HSM (e.g. 3-of-5 security officers) | Role keys, admin roster | Rare: key rotation |
 | `admins` | Each admin's **FIDO2/PIV hardware key**; roster signed by `root` | High-risk payloads: `root-full` scripts, wipe/lock, ceiling changes, policy sets marked `privileged` | Every risky action |
 | `policy` | Online KMS | Routine declaration manifests (low-risk resource types) | Day-to-day sync |
+| `lease` | Online KMS-backed delegation under `root` | Workspace key leases (online/offline release envelopes) | Per lease issuance; cannot sign commands |
 | `timestamp` | Online | Freshness, so the server can't replay stale manifests | Constant |
 
 **Risk classes** are fixed per resource type in the spec. For example, `desktop.screenlock` is low risk; `sudo`, `pam.policy` and `script:root-full` are high risk. Devices refuse high-risk payloads that aren't signed by the required number of admin keys. Tenants set thresholds (e.g. two admins for wipe on more than 10 devices).
@@ -903,10 +902,11 @@ TRP-ATTESTED-1.0
   A-BOOT-02 MUST publish reference measurements for every shipped kernel/boot-chain
             artefact: either signed PCR 11 policies (UKI + systemd-measure) or
             systemd-pcrlock policy files, at a stable URL listed in conformance.json.
-  A-BRK-01  Proposed: owner-controlled, consent-gated workspace TPM broker: create,
-            certify, quote, seal/unseal and counters. No raw TPM access for work UIDs.
-            Default budget: two 8-byte NV counters per (human, tenant); exhaustion
-            denies hardware-backed offline capability. See MAM supplement.
+  A-BRK-01  (Proposed 1.1 addition) SHOULD provide an owner-controlled, consent-gated
+            workspace TPM broker: create, certify, quote, seal/unseal and counters.
+            No raw TPM access for work UIDs. Default budget: two 8-byte NV counters
+            per (human, tenant); exhaustion denies hardware-backed offline
+            capability. See MAM supplement.
   A-WIPE-01 SHOULD ship a signed "tuxherd-recovery" UKI (or boot entry) capable of
             NVMe sanitize / ATA secure erase, TPM PPI clear request, and FDO re-onboarding.
 
@@ -927,9 +927,9 @@ TRP-IMMUTABLE-1.0
   I-ETC-01  /etc MUST be writable and preserved across image updates (3-way merge or overlay).
   I-APP-01  MUST support Flatpak with tenant-configurable remotes.
 
-TRP-Workspace 2.0 (proposed; supersedes the 1.0 workspace checklist)
+TRP-WORKSPACE-2.0 (proposed; supersedes the 1.0 workspace checklist)
   W-HOM-01  SHOULD use systemd-homed with LUKS2; fscrypt fallback permitted at reduced
-            assurance for distro adoptability. Support the chosen activation path.
+            assurance for distro adoptability. MUST support the chosen activation path.
   W-HOM-02  MUST lock affected workspace volumes on suspend, controlling-session lock/logout,
             idle timeout and lease expiry; preserve unaffected sibling instances.
   W-ABI-01  MUST pass the versioned runtime/denied-flow contract in the MAM supplement;
