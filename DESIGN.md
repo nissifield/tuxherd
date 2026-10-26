@@ -813,6 +813,7 @@ Enforcement:
 | Personal-session compositor compromise | Dedicated bridge UID, default-deny protocols, FIDO2 presence unlock; separate seat recommended and required above ordinary internal on T0 | Bridged pixels/input exposed; captured sudo/polkit credentials can lead to root. Separate seat still shares the kernel. |
 | Tenant code surveys personal LAN/host | Owner-controlled LAN/link-local/loopback floor, `/sys` and `/proc` masking, brokered devices, verdict-only reporting | Owner exceptions weaken protection; shared kernel/permitted traffic retain fingerprinting and covert-channel risk. |
 | Device tenant vs. co-resident workspace tenant | Local-only workspace allowlist; consented anonymous host-authority signal; encrypted locked volumes | Root core compromise or T2 root authority exposes unlocked co-resident data; measured boot does not remove this TCB. |
+| Screen photography or capture leak | Optional server-side forensic/visible watermark; audit | Deters and traces only; root or compositor can capture before the mark is applied; marks can be forged if keys leak |
 
 ---
 

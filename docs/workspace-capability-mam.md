@@ -162,6 +162,8 @@ Filter clipboard, drag/drop, file import/export, open-URI and screencast by tena
 
 This can prevent workspace apps capturing personal windows and reduce accidental exports through supported APIs. It cannot promise screenshot blocking: personal-session compromise of the compositor can capture every workspace pixel and keystroke, and root or an external camera can capture too. Watermarks/audit deter; they cannot prevent capture. A dedicated bridge UID protects the filter from direct same-UID tampering, not from the compositor it must trust.
 
+Display-layer obfuscation (temporal flicker, sub-visible or "encrypted" pixel encoding, anti-camera dithering) is not a control: the host composes the plaintext the user perceives, holds any encoding key, and can integrate frames as the eye does. Forensic watermarks, if used, are embedded server-side with server-held keys and opaque identifiers, disclosed at consent, and are never sole attribution evidence. Hardware-protected display paths or trusted external displays remove the host from the trust path and belong to a separately approved tier, not T0.
+
 Applications print only to the workspace PDF/virtual printer. Deny, keep encrypted, or audit and forward by IPPS through the tenant tunnel; no host CUPS forwarding exception is permitted in this proposal. Previews/temp PDFs/spools stay encrypted or ephemeral. No direct discovery/printer path; owner network exceptions that permit bypass remove the managed-print verdict. Exported PDFs and physical output leave workspace control. Host capture/hostility defeats local print restrictions.
 
 ## Fedora and NixOS implementation notes
@@ -189,6 +191,7 @@ The device tenant is in co-resident workspaces' TCB when its core can act as roo
 | Personal-session compositor compromise | Dedicated bridge UID and default-deny protocols; FIDO2 presence unlock; stronger separate seat recommended, required above ordinary internal on T0 | Bridged pixels/input are exposed; an administrator's captured sudo/polkit credentials can lead to root. Separate seat still shares the kernel. |
 | Tenant code surveys personal LAN/host | Owner-controlled LAN/link-local/loopback floor, `/sys` and `/proc` masking, brokered devices, verdict-only reporting | Owner exceptions weaken protection; shared kernel and permitted external traffic retain fingerprinting/covert-channel risk. |
 | Device tenant vs. co-resident workspace tenant | Local-only allowlist, consented anonymous host-authority signal, encrypted locked volumes | Root core compromise or T2 root authority exposes unlocked co-resident data; measured boot does not remove this TCB. |
+| Screen photography or capture leak | Optional server-side forensic/visible watermark; audit | Deters and traces only; root or compositor can capture before the mark is applied; marks can be forged if keys leak |
 
 ## Roadmap impact and decisions
 
