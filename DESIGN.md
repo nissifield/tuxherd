@@ -9,7 +9,7 @@
 **Tuxherd** is an open protocol plus a distro conformance profile. Together they make any Linux install managed from day one, the way Windows is under Intune or macOS is under Apple's MDM and Declarative Device Management. It has three deliverables:
 
 1. **Tuxherd Protocol (TP/1):** a wire protocol between a device agent and a management plane. It covers device identity and enrollment, declarative configuration and compliance, inventory and status, and signed remote actions.
-2. **Tuxherd Ready Profile (TRP):** a versioned, testable spec that says what a distro ships so that its installs speak TP/1 without extra work. That means an agent in the official repos, installer enrollment hooks, TPM-backed FDE, drop-in configuration paths, advisory feeds, and immutable-image support.
+2. **Tuxherd Ready Profile (TRP):** a versioned, testable spec that says what a distro ships so that its installs speak TP/1 without extra work. That means an agent in the official repos, installer enrollment hooks, FDE with recovery escrow (TPM-bound unlock where hardware allows), drop-in configuration paths, advisory feeds, and immutable-image support.
 3. **Reference implementations:** a small, Apache-2.0-licensed agent (`tuxherdd`, written in Rust) and a minimal reference server. These prove the spec and give distros something to package. They are not meant to beat commercial management planes.
 
 **Why now.**
@@ -42,7 +42,7 @@ Every Linux management tool today has its own enrollment, agent and control chan
    | Compliance content | OpenSCAP / SCAP Security Guide, CIS |
    | Encryption | LUKS2, `systemd-cryptenroll` |
    | Boot integrity | UKI, `systemd-measure`, `systemd-pcrlock`, Keylime-style verification |
-   | Device certificates | ACME `device-attest-01` (step-ca already implements it) |
+   | Device certificates | ACME; optional `device-attest-01` (step-ca already implements it) |
    | Zero-touch | FIDO Device Onboard (FDO), already packaged in RHEL for Edge |
    | Firmware | fwupd/LVFS, kernel `firmware-attributes` |
    | Software | PackageKit, AppStream IDs, Flatpak |
@@ -76,7 +76,7 @@ Legend for "What closes the gap":
 
 | Capability | Intune on Windows | Intune on Linux (2026-10) | Tuxherd design | What closes the gap |
 |---|---|---|---|---|
-| Device registration / identity | Entra join, TPM-backed | Entra registration (Ubuntu 24.04/26.04 GNOME, RHEL 9/10) | ACME device-attest-01 TPM-bound device cert, any TRP distro | **P + D** |
+| Device registration / identity | Entra join, TPM-backed | Entra registration (Ubuntu 24.04/26.04 GNOME, RHEL 9/10) | ACME device cert, TPM-bound where present (software key otherwise), any TRP distro | **P + D** |
 | Zero-touch provisioning | Autopilot (OEM hardware hash) | None | FDO ownership vouchers, account-driven enrollment (`.well-known`), installer profiles | **P + D** (+ OEM participation) |
 | Compliance policies | Rich | Distro/version, encryption, password complexity, custom scripts | Typed facts + CEL rules + OpenSCAP profiles, device and user scope | **P** (schema), **I** |
 | Conditional Access | Native | M365 web apps in Edge only | SSF/CAEP to any OIDC IdP, mTLS device certs, Intune custom-compliance bridge | **P** (signal profile), **I** |
@@ -86,8 +86,8 @@ Legend for "What closes the gap":
 | Hardware inventory | Yes | None | DMI/udev/fwupd/TPM facts | **P** (schema), **I** |
 | OS update rings | WUfB rings, deferrals | None | Ring declarations. Image digests on immutable systems; snapshot/mirror pins on package-based systems | **P**, **D** (snapshot repos) |
 | Firmware updates | Driver/firmware via WU | None | fwupd/LVFS policy + HSI compliance | **I** (exists), **P** (schema) |
-| Disk encryption + key escrow | BitLocker + escrow | Compliance check only | LUKS2 + TPM2 enroll + recovery-key escrow + rotation | **D** (installer), **P** (escrow) |
-| Remote lock | Yes | None | Session / account / device lock (TPM keyslot removal) + offline lease | **P**, **I** |
+| Disk encryption + key escrow | BitLocker + escrow | Compliance check only | LUKS2 + TPM2/FIDO2/passphrase unlock + escrow + rotation | **D** (installer), **P** (escrow) |
+| Remote lock | Yes | None | Session / account / device lock (keyslot removal) + offline lease | **P**, **I** |
 | Remote wipe / Fresh Start | Yes | None | Tiered wipe: workspace / userdata / crypto-erase / sanitize + re-provision | **P + D** (recovery UKI) |
 | Retire / selective wipe | Yes | None | Managed-state rollback, workspace removal | **P** |
 | Scripts | PowerShell | Bash (15-min default) | Signed scripts in transient systemd units with sandbox profiles | **P** (signing), **I** |
@@ -97,7 +97,7 @@ Legend for "What closes the gap":
 | Certificate / Wi-Fi / VPN profiles | SCEP/PKCS, profiles | None | ACME/SCEP user certs, NM keyfiles, trust-store abstraction | **P**, **D** (trust store paths) |
 | Per-user policy on multi-user systems | Yes | First user only (Himmelblau limitation) | Device scope + user scope via logind/PAM session agent | **P + D** (hard; see §6.5) |
 | BYOD / MAM separation | Work profile / MAM | Not offered (all corporate) | Work user (homed) + capability ceiling + privacy allowlist | **P + D** |
-| Device health attestation | DHA / MAA | None | TPM quote + event log + distro reference measurements | **D** (hard), **P** |
+| Device health attestation | DHA / MAA | None | TPM quote + event log + distro reference measurements (optional; requires TPM) | **D** (hard), **P** |
 | RBAC / audit | Yes | Yes (server side) | Server side + device-verified admin signatures + transparency log | **P** (signatures), **I** |
 
 **Takeaway.** About a third of the gaps are pure implementation that Fleet, Rudder and others have partly solved. The parts no single vendor can fix are enrollment, attestation, the config intent catalog, wipe semantics, per-user scope and BYOD separation. Each needs either a shared protocol or distro cooperation, and that is Tuxherd's scope.
@@ -145,7 +145,7 @@ flowchart LR
       PROV[Resource providers<br/>sandboxed helpers]
       RUN[Script runner<br/>transient systemd units]
       COL[Fact collectors<br/>+ optional osquery]
-      TPM[(TPM 2.0)]
+      TPM[(TPM 2.0, optional)]
     end
     subgraph User["user session"]
       SESS[tuxherd-session<br/>user-scope agent]
@@ -180,7 +180,7 @@ flowchart LR
 |---|---|---|
 | API gateway | mTLS termination, device-cert validation, rate limiting, tenant routing | Envoy / nginx; standard |
 | Enrollment service | Authenticates the bootstrap credential (token, OIDC, FDO voucher), drives attestation, binds device to tenant | **[NEW]** logic on proven primitives |
-| Device CA | Issues short-lived device certs via ACME with `device-attest-01` | step-ca (already supports TPM device attestation) |
+| Device CA | Issues short-lived device certs via ACME with optional `device-attest-01`; bootstrap-authorized software-key proof otherwise (§5.5) | step-ca (already supports TPM device attestation) |
 | Device directory | Device records, ownership mode, groups, lifecycle state, capability ceiling | Postgres |
 | Workspace registry | T0/T1/T2 workspace instances, registered user/tenant keys and workspace-only ceilings; separate from device enrollment | **[NEW]**, proposed MAM supplement |
 | Workspace key broker / verifier | Bounded instance-volume leases; policy/evidence evaluation; independent instance KEKs wrapped by tenant KMS keys | **[NEW]**, KMS/HSM + signed reference-policy verification |
@@ -203,7 +203,7 @@ Self-hosted and SaaS deployments use the same components. The reference server s
 
 | Component | Privilege | Notes |
 |---|---|---|
-| `tuxherdd` core | root, systemd-hardened (`ProtectSystem=strict`, `NoNewPrivileges`, tight `CapabilityBoundingSet`, `SystemCallFilter`) | Protocol client, signature/TUF verification, capability-ceiling enforcement, local CEL evaluator, state engine, TPM access via `/dev/tpmrm0`. Target: under 30k lines of Rust. |
+| `tuxherdd` core | root, systemd-hardened (`ProtectSystem=strict`, `NoNewPrivileges`, tight `CapabilityBoundingSet`, `SystemCallFilter`) | Protocol client, signature/TUF verification, capability-ceiling enforcement, local CEL evaluator, state engine, optional TPM access via `/dev/tpmrm0`. Target: under 30k lines of Rust. |
 | Resource providers | One helper per resource type, each with its own systemd sandbox profile (e.g. the sysctl provider may only write `/etc/sysctl.d/`) | Out-of-process. A vendor plugin can't take down the core. Plugin ABI = JSON over stdin/stdout, versioned. |
 | Fact collectors | Mostly unprivileged (`DynamicUser=`); root only where unavoidable | Native collectors for core facts. **osquery is optional** (see §11 for why). |
 | Script runner | Scripts run in transient units (`systemd-run`) with a declared sandbox profile: `root-full`, `root-restricted`, `user` | Output capped and hashed; exit codes reported. |
@@ -222,7 +222,7 @@ Local state lives at `/var/lib/tuxherd/`:
 
 | ID | Boundary | Crossing mechanism | Key assumption |
 |---|---|---|---|
-| TB1 | Device ↔ management plane over the internet | mTLS, TLS 1.3; device cert bound to TPM key; server cert pinned to tenant CA from enrollment | Network is hostile |
+| TB1 | Device ↔ management plane over the internet | mTLS, TLS 1.3; device cert bound to the device key (TPM-resident at `tpm-key`/`tpm-measured`; software at `software`); server cert pinned to tenant CA from enrollment | Network is hostile |
 | TB2 | Root agent ↔ user session | D-Bus with polkit; the session agent can *request* but never *command* the core | User processes may be malicious (especially on BYOD) |
 | TB3 | Admin ↔ management plane | WebAuthn login; FIDO2/PIV signatures on high-risk payloads | An admin account may be phished; one admin may be rogue |
 | TB4 | Online signing ↔ tenant root of trust | TUF-style delegation; root key offline / threshold | The server may be compromised |
@@ -239,7 +239,7 @@ TP/1 is layered and uses HTTPS everywhere, so it works through corporate proxies
 | Layer | Content | Modelled on |
 |---|---|---|
 | **Discovery** | `GET /.well-known/tuxherd-configuration`: endpoints, tenant ID, CA bundle, supported versions, required TRP profile | OIDC discovery |
-| **Identity** | Enrollment + ACME device-attest-01 + rotation | RFC 8555 + ACME device-attest draft; smallstep |
+| **Identity** | Enrollment + ACME (optional device-attest-01) + rotation | RFC 8555 + ACME device-attest draft; smallstep |
 | **Sync** | Device sends `CheckIn{manifest_hash}`; server returns a TUF-style signed manifest of declaration hashes; device fetches what's missing | Apple DDM `DeclarationItems` + TUF snapshot/targets |
 | **Declarations** | Four kinds: `configuration` (desired state), `asset` (blob: cert, script, file, package source), `activation` (CEL predicate binding configs to conditions), `management` (org info, server capabilities, ceiling proposals) | Apple DDM |
 | **Status** | Device sends typed status items (facts, compliance results, declaration state) only as deltas; signed by the device key | DDM status channel |
@@ -255,13 +255,13 @@ Encoding: JSON + JWS (RFC 7515) in v1, chosen because it is easy to debug. A CBO
 
 ### 5.1 Identity model
 
-- **Device key:** an ECC P-256 key generated *inside* the TPM, non-exportable, with an auth policy bound to the agent. On devices without a TPM it is a software key in `/var/lib/tuxherd/identity` (TRP-Core only, trust level `software`).
+- **Device key:** an ECC P-256 key generated *inside* the TPM, non-exportable, with an auth policy bound to the agent. On devices without a TPM it is a software key in `/var/lib/tuxherd/identity` (trust level `software`).
 - **Attestation key (AK):** a TPM restricted signing key, certified to the EK through credential activation (`TPM2_MakeCredential` / `ActivateCredential`).
 - **EK certificate:** proves a genuine TPM.
   - Discrete TPMs usually carry it in NV.
-  - Intel PTT and AMD fTPM certs are fetched from vendor endpoints. This is an TRP requirement: the distro ships the retrieval helper and CA bundles.
-- **Device certificate:** issued by the tenant CA. Lifetime 30 days, renewed at 2/3 of lifetime over mTLS with the current cert plus a fresh attestation.
-  - Subject alternative names: `URI:urn:tuxherd:device:<uuid>`, plus the `permanent-identifier` (an EK hash) as in the ACME device-attest draft.
+  - Intel PTT and AMD fTPM certs are fetched from vendor endpoints. TRP-Attested requires the distro to ship the retrieval helper and CA bundles; neither enrollment nor other profiles require a TPM.
+- **Device certificate:** issued by the tenant CA. Lifetime 30 days, renewed at 2/3 of lifetime over mTLS with the current cert plus fresh proof of the device key; fresh attestation at TPM trust levels. Each renewal presents the previous renewal's server nonce and receives the next one; divergent renewal chains flag clones for quarantine. Software keys prove continuity, not hardware identity.
+  - Subject alternative names: `URI:urn:tuxherd:device:<uuid>`, plus, where EK disclosure is permitted, the `permanent-identifier` (an EK hash) as in the ACME device-attest draft; no EK identifier at `software`.
 - **Trust levels** recorded in the device record and in every signal:
 
 | Level | Meaning |
@@ -269,6 +269,10 @@ Encoding: JSON + JWS (RFC 7515) in v1, chosen because it is easy to debug. A CBO
 | `software` | Key on disk. Proves continuity only. |
 | `tpm-key` | Key is TPM-resident; EK chain verified. |
 | `tpm-measured` | As above, plus a quote over PCRs 0, 2, 4, 7 and 11 (and 9/12 where useful) that matches the distro's reference measurements. |
+
+No trust level is required to enroll, including corporate. Tenants set the minimum via `require_trust_level`. At `software`, boot-security facts are device claims only.
+
+> TPM gates **assurance claims, never access**. Where software cannot honestly provide a property, such as rollback-resistant offline leases or measured-host evidence, the software path is the next lower capability: online-only access with memory-only leases. This is a policy outcome of the data class, not a TPM requirement. Every TPM-less host keeps enrollment, compliance, FDE with escrow, lock/wipe and online workspace access.
 
 Workspace subjects use a separate `assurance` vocabulary: `workspace-unattested` for self/helper reports, or `workspace-measured-host` for fresh, workspace-key-bound boot evidence accepted against independently trusted references. This is the workspace-subject counterpart of device `trust_level`, not an equivalent or promotion to `tpm-measured`. T1/T2 workspaces report `assurance` independently of their enrolled device's `trust_level`; T0 has no device trust claim. Measurement never proves mutable runtime integrity or increases tenant authority. See the [supplement](docs/workspace-capability-mam.md#capability-and-compliance-signals) for the closed verdict schema and consent rules.
 
@@ -283,6 +287,8 @@ Workspace subjects use a separate `assurance` vocabulary: `workspace-unattested`
 
 ### 5.3 Zero-touch flow (corporate)
 
+This example shows the optional TPM-attested path. Vouchers bind to the device key, which may be software-backed; TPM-less devices use the software proof flow in §5.5.
+
 ```mermaid
 sequenceDiagram
   participant OEM as OEM / reseller
@@ -290,7 +296,7 @@ sequenceDiagram
   participant RV as FDO rendezvous
   participant D as Device (first boot)
   participant CA as Tenant CA (ACME)
-  OEM->>T: Ownership voucher (signed chain, bound to device TPM key)
+  OEM->>T: Ownership voucher (signed chain, bound to device key)
   T->>RV: Register "voucher GUID → tenant enrollment URL"
   D->>RV: FDO TO1 (prove device key)
   RV-->>D: Signed redirect to tenant
@@ -310,11 +316,13 @@ sequenceDiagram
 1. The user runs `tuxherdctl enroll you@corp.example` (or the GUI). Discovery returns the tenant config with `byod_allowed: true`.
 2. The user signs in to the IdP (device-code or browser flow). The IdP token proves *who*, not *what device*.
 3. The agent shows the **BYOD consent screen**. It is generated from the tenant's requested capability ceiling and checked against the protocol's hard BYOD maximum (§8.4, §10.5). It lists exactly what can be collected and done. The user accepts or cancels.
-4. A TPM-backed device key is generated if a TPM exists. No EK identity is sent unless the user opts in: BYOD uses **privacy-preserving attestation**, where the AK is certified but the EK hash is not stored by the tenant.
+4. A TPM-backed device key is generated if a TPM exists; otherwise a software device key is generated at `software` trust. No EK identity is sent unless the user opts in: when attestation is used, BYOD uses **privacy-preserving attestation**, where the AK is certified but the EK hash is not stored by the tenant.
 5. The work workspace is provisioned (§9).
 6. The cert is issued with `ownership=byod`. The ceiling is signed by both the device and the tenant and stored locally.
 
 ### 5.5 Sample enrollment handshake
+
+The sample below requests `tpm-measured`. At `software`, omit `tpm`, credential activation and quote fields. The server authorizes certificate issuance from the bootstrap credential plus nonce-bound proof of the software device key, rather than `device-attest-01`; completion returns the cert and device-signed ceiling acknowledgement without TPM evidence. Corporate software enrollment supports device-bound pre-registration, single-use tokens and an optional approval queue; it cannot prevent a stolen token being used by a VM. A distro profile claim never forces the attested path.
 
 **Step 1: device → `POST /sp1/enroll/begin`**
 
@@ -364,14 +372,14 @@ sequenceDiagram
 - the EK chain against the TPM vendor CAs;
 - credential activation;
 - quote freshness;
-- the event log against the distro reference measurements (only if the TRP-Attested profile is claimed).
+- the event log against the distro reference measurements (only for `tpm-measured`, not merely because the distro claims TRP-Attested).
 
 It then returns the initial signed manifest.
 
 ### 5.6 Lifecycle
 
 ```
-          ┌──────────┐ claim/voucher/token   ┌──────────┐  attest+cert   ┌─────────┐
+          ┌──────────┐ claim/voucher/token   ┌──────────┐  proof+cert    ┌─────────┐
  (factory)│REGISTERED├──────────────────────►│ENROLLING ├───────────────►│ MANAGED │◄─┐ cert rotation
           └──────────┘                        └──────────┘                └──┬──┬───┘──┘ (every ~20d)
                                                                              │  │
@@ -422,10 +430,9 @@ spec:
     mode: enforce
 
   compliance:
-    - id: fde-tpm
+    - id: fde-escrowed
       rule: >
         facts.storage.root.encryption.type == "luks2" &&
-        facts.storage.root.encryption.tpm2_bound &&
         facts.storage.root.encryption.recovery_escrowed
       severity: critical
       grace: 0h
@@ -454,7 +461,12 @@ spec:
 
   configuration:
     - type: org.tuxherd.disk.encryption/v1
-      settings: { require: luks2, tpm2_pcrs: [7, 11], pin: optional, escrow_recovery: true, rotate_recovery_on_use: true }
+      settings:
+        require: luks2
+        unlock: [tpm2+pin, fido2, passphrase]  # first available
+        tpm2_pcrs: [7, 11]                   # only when tpm2 is used
+        escrow_recovery: true
+        rotate_recovery_on_use: true
     - type: org.tuxherd.desktop.screenlock/v1
       settings: { enabled: true, idle_delay: 300s, lock_on_suspend: true, user_may_tighten: true, user_may_loosen: false }
     - type: org.tuxherd.ssh.server/v1
@@ -497,7 +509,7 @@ Compliance only matters if it gates access. There are three integration paths.
 
 | Path | Mechanism | Status |
 |---|---|---|
-| **A. Native OIDC IdPs** (Keycloak, Okta, Authentik, Ping, Google) | **SSF/CAEP** `device-compliance-change` events pushed to the IdP. At sign-in the IdP checks posture by (a) **mTLS client cert** from the TPM device key, exposed through `tpm2-pkcs11` to browsers via p11-kit/NSS, or (b) a **device posture token**: a short-lived JWS from the management plane, bound to the device key, delivered through a native-messaging browser extension or a D-Bus SSO broker. | (a) proven pattern; (b) **[NEW]** small. Keycloak needs a Tuxherd authenticator SPI (**[NEW]**, small). |
+| **A. Native OIDC IdPs** (Keycloak, Okta, Authentik, Ping, Google) | **SSF/CAEP** `device-compliance-change` events pushed to the IdP. At sign-in the IdP checks posture by (a) **mTLS client cert** from the device key via PKCS#11 (`tpm2-pkcs11`, or a software token at `software` trust), exposed to browsers via p11-kit/NSS, or (b) a **device posture token**: a short-lived JWS from the management plane, bound to the device key, delivered through a native-messaging browser extension or a D-Bus SSO broker. | (a) proven pattern; (b) **[NEW]** small. Keycloak needs a Tuxherd authenticator SPI (**[NEW]**, small). |
 | **B. Entra ID on Intune-supported distros** (Ubuntu, RHEL) | Run Microsoft's Intune agent *alongside* Tuxherd. Tuxherd publishes a compliance summary that an **Intune custom compliance discovery script** reads, staying within the user-context and 1 MB limits. Intune remains the CA authority. | Works within today's documented features. Fragile: depends on Microsoft not changing script semantics. |
 | **C. Entra on other distros** | Partner with **Himmelblau**: Himmelblau handles Entra join/PRT/Intune enrollment, and Tuxherd provides compliance facts and enforcement. Long term, lobby Microsoft to (1) accept third-party Linux compliance through its device-compliance-partner channel or (2) implement TP/1 server endpoints in Intune itself. | Partnership is realistic; Microsoft cooperation is an open question (§14). |
 
@@ -550,9 +562,9 @@ The design:
 | `firewall` | firewalld zones/policies, or nftables `/etc/nftables.d/` | One of the two (TRP) |
 | `network.connection` | NetworkManager keyfiles (Wi-Fi 802.1X, VPN) in `/etc/NetworkManager/system-connections/` | NetworkManager (desktop TRP) |
 | `trust.anchor` | `update-ca-trust` / `update-ca-certificates` / p11-kit anchors | Paths differ per distro family; the abstraction handles it |
-| `cert.enroll` | ACME/SCEP client, keys in TPM via tpm2-pkcs11 | |
+| `cert.enroll` | ACME/SCEP client, device key via PKCS#11 (tpm2-pkcs11, or a software token at `software` trust) | |
 | `browser.policy` | Firefox `/etc/firefox/policies/policies.json`; Chromium/Chrome `/etc/{chromium,opt/chrome}/policies/managed/` | **Hard for Flatpak browsers:** a sandboxed browser may not read host `/etc`. TRP asks distros/Flathub for a documented policy mount path. Open item. |
-| `disk.encryption` | `cryptsetup`, `systemd-cryptenroll` (TPM2, recovery), escrow upload | TRP-Attested |
+| `disk.encryption` | `cryptsetup`, `systemd-cryptenroll` (TPM2, FIDO2, passphrase, recovery), escrow upload | TRP-Protected |
 | `updates` | See §7.4 | |
 | `firmware` | fwupd D-Bus: update policy, HSI reporting, BIOS settings via kernel `firmware-attributes` (Dell/Lenovo/HP drivers) | fwupd ≥ 1.9 |
 | `software` | See §7.2 | |
@@ -657,10 +669,10 @@ Linux has no firmware-level "activation lock", so lock is tiered.
 |---|---|---|
 | `session` | `loginctl lock-sessions` + notification | Cosmetic: the user just unlocks |
 | `account` | Kill sessions; PAM `account` deny via a `pam_tuxherd` flag file or `pam_access` drop-in; invalidate cached credentials (SSSD/Himmelblau cache flush); disable the LAPS account; GDM/SDDM banner via dconf/theme; Plymouth message on boot | Stops normal use; defeated by booting other media *only if* the disk is unencrypted |
-| `device` | All of `account`, plus **remove TPM2 keyslots** from LUKS (`systemd-cryptenroll --wipe-slot=tpm2`), leaving only the escrowed recovery key and any user passphrase/PIN slots by policy, then reboot. The device boots to a LUKS prompt showing a "contact IT" message. Unlocking means IT reads out the recovery key, which is rotated on use. | Strong *if* FDE + TPM-only unlock (TRP-Attested). The thief needs the recovery key. |
+| `device` | All of `account`, plus **remove all non-recovery keyslots** from LUKS (TPM2, FIDO2, or the passphrase slot per policy), leaving only the escrowed recovery key, then reboot. The device boots to a LUKS prompt showing a "contact IT" message. Unlocking means IT reads out the recovery key, which is rotated on use. | Strong once applied with any unlock method. TPM-only unlock additionally stops a thief who never knew a passphrase from getting past boot. |
 | `lease` (offline) | Device-side dead-man switch: if no successful check-in for N days (tenant-set; default off; recommended 30d for corporate laptops), the agent applies the `account` or `device` tier itself | Covers devices stolen while offline. Must be clearly disclosed. Never allowed on BYOD. |
 
-Unlock is a signed command, or a recovery-key flow at the LUKS prompt.
+Unlock is a signed command, or a recovery-key flow at the LUKS prompt. Without TPM-bound unlock, FIDO2/passphrase boot requires user interaction and has no PCR-bound sealing against boot-chain tampering; Secure Boot still applies.
 
 ### 8.2 Wipe: what it can realistically mean on Linux
 
@@ -670,11 +682,11 @@ Wipe is only as strong as the encryption under it.
 |---|---|---|---|
 | `workspace` | Remove the work user: `homectl remove` destroys the homed LUKS image and its key; work certs, NM work profiles, work Flatpak data and agent identity are removed | Work data crypto-shredded; personal data untouched | Work user on `systemd-homed` (or fscrypt). **The only wipe tier allowed on BYOD.** |
 | `userdata` | All non-system homes crypto-shredded (homed) or deleted; local accounts reset; OS kept; device re-enrolls | Strong for homed/fscrypt; best-effort deletion otherwise | — |
-| `crypto-erase` | `cryptsetup luksErase` (destroys all keyslots), overwrite both LUKS2 header copies, `blkdiscard` the header region, **server destroys its escrowed recovery key** (logged), reboot | Data cryptographically unrecoverable *if* no one else holds a header backup or key. SSD wear levelling may keep stale header blocks, but the volume key in them is still wrapped by keyslots whose secrets are gone. | LUKS2 FDE (TRP-Attested); escrow destruction is the key step |
-| `sanitize` | Reboot into the **signed Tuxherd recovery UKI** (shipped by the distro, §11). Run NVMe Sanitize (crypto-erase) / Format with SES=2 or ATA Secure Erase; request a TPM clear via **ACPI PPI** (`/sys/class/tpm/tpm0/ppi/request`); optionally reset BIOS settings via `firmware-attributes`; then either power off or **re-provision** through zero-touch ("Fresh Start / Autopilot Reset") | Strongest available; hardware-assisted | Recovery UKI, storage that supports sanitize, firmware that honours PPI |
+| `crypto-erase` | `cryptsetup luksErase` (destroys all keyslots), overwrite both LUKS2 header copies, `blkdiscard` the header region, **server destroys its escrowed recovery key** (logged), reboot | Data cryptographically unrecoverable *if* no one else holds a header backup or key. SSD wear levelling may keep stale header blocks, but the volume key in them is still wrapped by keyslots whose secrets are gone. | LUKS2 FDE (TRP-Protected); escrow destruction is the key step |
+| `sanitize` | Reboot into the **signed Tuxherd recovery UKI** (shipped by the distro, §11). Run NVMe Sanitize (crypto-erase) / Format with SES=2 or ATA Secure Erase; where a TPM is present, request a TPM clear via **ACPI PPI** (`/sys/class/tpm/tpm0/ppi/request`); optionally reset BIOS settings via `firmware-attributes`; then either power off or **re-provision** through zero-touch ("Fresh Start / Autopilot Reset") | Strongest available; hardware-assisted | Recovery UKI, storage that supports sanitize; PPI-capable firmware only for optional TPM clear |
 
 **Firmware considerations, stated openly:**
-- TPM clear via PPI usually needs **physical presence confirmation at the next boot** unless the firmware is configured otherwise. An unattended remote TPM clear is often impossible, and that is a deliberate firmware design choice. Practical consequence: after `sanitize`, sealed TPM objects are unusable anyway because PCRs and SRK seeds change on the next ownership.
+- TPM clear via PPI usually needs **physical presence confirmation at the next boot** unless the firmware is configured otherwise. An unattended remote TPM clear is often impossible, and that is a deliberate firmware design choice. Storage sanitize does not itself clear the TPM; report the optional TPM clear separately and do not make sanitize completion depend on it.
 - **BIOS admin passwords** and vendor settings can be managed only through vendor `firmware-attributes` drivers. Coverage varies by OEM.
 - **Unencrypted devices cannot be reliably wiped remotely.** Overwriting files on SSDs is not trustworthy. The compliance model treats "no FDE" as making the device ineligible for `crypto-erase`; only `sanitize` applies, and it reports `wipe_guarantee: best_effort`.
 - Every wipe ends with a **wipe receipt**: a signed status item with TPM quote if possible, sent *before* the destructive step where possible and queued otherwise. Lack of a receipt after a timeout is itself reported.
@@ -744,7 +756,7 @@ The separate work-user model below uses a **separate seat session with its own c
 ## 10. Security architecture & threat model
 
 ### 10.1 Transport and identity
-- TLS 1.3 mTLS. The device cert is backed by a TPM key; the server cert is pinned to the tenant CA delivered at enrollment.
+- TLS 1.3 mTLS. The device cert is bound to the device key (TPM-resident at `tpm-key`/`tpm-measured`; software at `software`); the server cert is pinned to the tenant CA delivered at enrollment.
 - Certificate lifetime 30 days with rotation, so revocation matters less.
 - Server-to-device content is **never trusted on transport alone**: every declaration manifest and command carries JWS signatures verified against the tenant's TUF root.
 
@@ -802,14 +814,14 @@ Enforcement:
 | Threat | Mitigation | Residual |
 |---|---|---|
 | Malicious local root (corporate device) | None can be complete. Attestation detects boot-chain tampering; IMA measurement of the agent is optional; the server re-evaluates facts; check-in gaps feed noncompliance | A root user can forge facts on a running system. Same as Intune/Windows. Relying parties must treat compliance as a claim. |
-| Stolen device, offline | FDE + TPM-only unlock bound to PCR 7/11 policy; lease lock; recovery key never stored on device | TPM sniffing attacks on discrete TPMs (mitigated by parameter encryption, which systemd-cryptenroll uses, and an optional PIN) |
+| Stolen device, offline | FDE unlocked by TPM2(+PIN) bound to PCR 7/11, FIDO2, or passphrase (argon2id); Secure Boot + UKI; lease lock | TPM: bus sniffing. Without TPM: offline passphrase guessing and no detection of boot tampering beyond Secure Boot |
 | Network MITM | mTLS + pinned CA + signed payloads | — |
 | Rogue / compromised server | §10.3–10.4 | Data exposure; denial of service |
 | Rogue admin | Multi-party thresholds, hardware keys, transparency log, device notification | Collusion of N admins |
 | Malicious tenant against BYOD user | Protocol-fixed BYOD maximum enforced by the agent; local transparency; user can unenroll | User must trust the agent build (distro-signed, reproducible) |
 | Supply-chain attack on agent | Distro packaging, reproducible builds, sigstore attestations, small core | Classic distro trust |
 | Downgrade of policy or agent | TUF timestamps/versions; agent minimum version in management declaration | — |
-| Enrollment token theft | Short-lived, count-limited, IP/ASN-scoped tokens; TPM attestation required for corporate trust level | Rogue enrollment of a VM with swtpm → caught by requiring EK chain to a hardware TPM vendor CA |
+| Enrollment token theft | Short-lived, single-use, IP/ASN-scoped tokens; tenant-chosen `require_trust_level`. `tpm-key` requires the EK chain to a hardware vendor CA. At `software`: device-bound pre-registration (serial/asset tag or FDO voucher), optional approval queue, renewal-chain clone detection | At `software`, a stolen token can enrol a VM or a cloned key. This is detected, not prevented |
 | Personal-session compositor compromise | Dedicated bridge UID, default-deny protocols, FIDO2 presence unlock; separate seat recommended and required above ordinary internal on T0 | Bridged pixels/input exposed; captured sudo/polkit credentials can lead to root. Separate seat still shares the kernel. |
 | Tenant code surveys personal LAN/host | Owner-controlled LAN/link-local/loopback floor, `/sys` and `/proc` masking, brokered devices, verdict-only reporting | Owner exceptions weaken protection; shared kernel/permitted traffic retain fingerprinting and covert-channel risk. |
 | Device tenant vs. co-resident workspace tenant | Local-only workspace allowlist; consented anonymous host-authority signal; encrypted locked volumes | Root core compromise or T2 root authority exposes unlocked co-resident data; measured boot does not remove this TCB. |
@@ -824,10 +836,13 @@ Enforcement:
 | Profile | Purpose | Builds on |
 |---|---|---|
 | **TRP-Core 1.0** | Manageable: enroll, inventory, compliance, config, scripts | — |
-| **TRP-Attested 1.0** | Hardware-backed identity, FDE + escrow, measured boot, strong lock/wipe | Core |
+| **TRP-Protected 1.0** | FDE + escrow, passphrase/FIDO2 unlock, Secure Boot, lock/wipe | Core |
+| **TRP-Attested 1.0** | Hardware-backed identity, TPM2 unlock, measured boot and TPM broker | Protected |
 | **TRP-Desktop 1.0** | Desktop settings, screen lock, browser policy, NM, first-boot enrollment UI | Core |
 | **TRP-Immutable 1.0** | Image-based distros: digest rings, sysext agent, confext | Core |
 | **TRP-Workspace 2.0** (proposed) | Workspace UID/lifecycle, bridge, portals, print/network privacy boundary and runtime ABI tests | Core packaging/OS-release items only (C-PKG-01–03, C-OSR-01–02); no Desktop or enrolled-agent dependency |
+
+Profile claims are distro conformance. No profile makes a TPM mandatory on any device; TPM-less devices enrol at `software`.
 
 **Supersession:** the [proposed MAM supplement](docs/workspace-capability-mam.md#trp-workspace-20) replaces the former TRP-Workspace definition (Desktop + homed) with **TRP-Workspace 2.0**. Homed is SHOULD, with fscrypt allowed at reduced assurance; relaxing W-HOM-01's MUST improves distro adoptability. TRP-Core is release conformance, not enrollment. The optional TPM/evidence broker belongs to TRP-Attested (A-BRK-01), not this workspace profile. Static release conformance remains distinct from per-host runtime verdicts; capability requirements at unattested assurance are configuration gates against mistakes, not controls against a dishonest owner.
 
@@ -884,32 +899,36 @@ TRP-CORE-1.0
             mirror product for ring pinning.
   C-FW-01   MUST package fwupd ≥ 1.9 and enable LVFS metadata (default may be disabled
             but MUST be enable-able by config).
-  C-TST-01  MUST pass the TRP-Core automated test suite (mkosi/openQA VM with swtpm)
-            for each claimed release, results published.
+  C-TST-01  MUST pass the TRP-Core automated test suite (mkosi/openQA VM with swtpm
+            and a no-TPM VM variant) for each claimed release, results published.
 
-TRP-ATTESTED-1.0
-  A-TPM-01  MUST ship tpm2-tss and allow agent access to /dev/tpmrm0 via a dedicated
-            group or systemd DeviceAllow.
-  A-TPM-02  MUST ship the EK-certificate retrieval helper and TPM vendor root/intermediate
-            CA bundle (incl. firmware TPM vendors' online EK cert services).
+TRP-PROTECTED-1.0 (builds on Core)
   A-FDE-01  The default installer path MUST offer LUKS2 full-disk encryption of the root
             filesystem; with an enrollment profile requesting it, MUST enable it without
             user interaction.
-  A-FDE-02  MUST support TPM2 unlock via systemd-cryptenroll (or clevis with tpm2 pin as
-            an allowed alternative), with recovery key generation, and MUST expose a hook
-            (/usr/lib/tuxherd/hooks/escrow.d/) the agent uses to escrow the recovery key at
-            install time.
+  P-FDE-02  MUST support passphrase/FIDO2 unlock with recovery key generation, and MUST
+            expose a hook (/usr/lib/tuxherd/hooks/escrow.d/) the agent uses to escrow the
+            recovery key at install time.
   A-BOOT-01 MUST boot with UEFI Secure Boot using distro-signed components.
+  A-WIPE-01 MUST ship a signed "tuxherd-recovery" UKI (or boot entry) capable of
+            NVMe sanitize / ATA secure erase and FDO re-onboarding.
+
+TRP-ATTESTED-1.0 (optional profile; builds on Protected)
+  A-TPM-01  MUST ship tpm2-tss and allow agent access to /dev/tpmrm0 via a dedicated
+            group or systemd DeviceAllow. The recovery UKI (or boot entry) MUST also
+            support a TPM PPI clear request.
+  A-TPM-02  MUST ship the EK-certificate retrieval helper and TPM vendor root/intermediate
+            CA bundle (incl. firmware TPM vendors' online EK cert services).
+  A-FDE-02  MUST support TPM2 unlock via systemd-cryptenroll (or clevis with tpm2 pin as
+            an allowed alternative), using Protected's recovery key generation and escrow hook.
   A-BOOT-02 MUST publish reference measurements for every shipped kernel/boot-chain
             artefact: either signed PCR 11 policies (UKI + systemd-measure) or
             systemd-pcrlock policy files, at a stable URL listed in conformance.json.
-  A-BRK-01  (Proposed 1.1 addition) SHOULD provide an owner-controlled, consent-gated
+  A-BRK-01  (Proposed 1.1 addition) MUST provide an owner-controlled, consent-gated
             workspace TPM broker: create, certify, quote, seal/unseal and counters.
             No raw TPM access for work UIDs. Default budget: two 8-byte NV counters
             per (human, tenant); exhaustion denies hardware-backed offline
             capability. See MAM supplement.
-  A-WIPE-01 SHOULD ship a signed "tuxherd-recovery" UKI (or boot entry) capable of
-            NVMe sanitize / ATA secure erase, TPM PPI clear request, and FDO re-onboarding.
 
 TRP-DESKTOP-1.0
   D-DE-01   Default desktop MUST support system-level, lockable settings
@@ -947,15 +966,15 @@ TRP-WORKSPACE-2.0 (proposed; supersedes the 1.0 workspace checklist)
   "tenant_ca_sha256": "b5e1…",
   "bootstrap": { "type": "enrollment-token", "token_file": "/etc/tuxherd/enrollment.d/00-corp.token" },
   "ownership": "corporate",
-  "require_trust_level": "tpm-key",
-  "install_actions": { "fde": "luks2-tpm2", "escrow_recovery": true }
+  "require_trust_level": "software", // tenant choice; tpm-key rejects swtpm/VMs
+  "install_actions": { "fde": "luks2", "unlock": "tpm2-else-passphrase", "escrow_recovery": true }
 }
 ```
 
 ### 11.4 Certification
 
-- The **test kit** is open source: mkosi-built VMs with `swtpm` and OVMF, plus an openQA integration for distros that use it. It covers enrollment, every core resource type's apply/observe/remove, attestation, wipe tiers, and BYOD refusal tests.
-- **Self-certification + published results** for TRP-Core. **Witnessed certification** (a foundation-run CI against the distro's ISO) for Attested and Workspace.
+- The **test kit** is open source: mkosi-built VMs with OVMF, both with `swtpm` and without a TPM, plus an openQA integration for distros that use it. It covers enrollment, every core resource type's apply/observe/remove, attestation, wipe tiers, and BYOD refusal tests.
+- **Self-certification + published results** for TRP-Core. **Witnessed certification** (a foundation-run CI against the distro's ISO) for Protected, Attested and Workspace.
 - The "Tuxherd Ready" trademark may be used only with current passing results.
 
 ---
@@ -1002,9 +1021,9 @@ Estimates assume a core team of experienced Rust/Go/systems engineers; "EM" = en
 | Phase | Scope | Ships | Team / duration | Effort |
 |---|---|---|---|---|
 | **0. Spec + coalition** | TP/1 draft (discovery, identity, sync, status, fact schema v1); TRP-Core draft; governance charter; 2 distro + 1 vendor letters of intent | Spec draft 0.5, charter, test-kit skeleton | 3 people, 4 months | ~12 EM |
-| **1. MVP: inventory + compliance + scripts** | Token, account-driven and installer enrollment; TPM-key identity via ACME device-attest; facts (OS, HW, packages, FDE, firewall, screen lock, HSI); CEL compliance; SCAP audit; signed scripts; reference server; SSF signals; Keycloak authenticator; Intune custom-compliance bridge | Agent packaged for Fedora 45/46, Ubuntu 26.04, Debian 13, openSUSE Tumbleweed/Leap 16; TRP-Core 1.0-rc; reference server | 7 eng, 8–9 months | ~60 EM |
+| **1. MVP: inventory + compliance + scripts** | Token, account-driven and installer enrollment; device identity via ACME (device-attest-01 when a TPM is present); facts (OS, HW, packages, FDE, firewall, screen lock, HSI); CEL compliance; SCAP audit; signed scripts; reference server; SSF signals; Keycloak authenticator; Intune custom-compliance bridge | Agent packaged for Fedora 45/46, Ubuntu 26.04, Debian 13, openSUSE Tumbleweed/Leap 16; TRP-Core 1.0-rc; reference server | 7 eng, 8–9 months | ~60 EM |
 | **2. Configuration & software** | Core resource catalog (§7.1) with apply/observe/remove + rollback; software abstraction (AppStream/native/Flatpak); repos; rings (digest/snapshot/deferral); LAPS; FDE enforce + escrow; admin signature model (TUF roles); transparency log | TRP-Core 1.0 final, TRP-Desktop 1.0, TRP-Immutable 1.0 (Fedora Atomic/bootc, openSUSE Aeon) | 9 eng, 6–8 months | ~65 EM |
-| **3. Remote actions** | Lock tiers incl. TPM-slot device lock; lease lock; retire; wipe tiers through `crypto-erase`; multi-party approvals; wipe receipts; recovery UKI prototype | TRP-Attested 1.0 (measured boot, reference measurements with ≥ 2 distros) | 8 eng, 6 months | ~45 EM |
+| **3. Remote actions** | Lock tiers incl. keyslot device lock; lease lock; retire; wipe tiers through `crypto-erase`; multi-party approvals; wipe receipts; recovery UKI prototype | TRP-Protected 1.0; optional TRP-Attested 1.0 (measured boot, reference measurements with ≥ 2 distros) | 8 eng, 6 months | ~45 EM |
 | **4. Zero-touch** | FDO integration (client in the installer/first boot, rendezvous, voucher import UI); `sanitize` wipe + re-provision; first OEM pilot (most realistic: System76, Framework, Lenovo/Dell Linux SKUs) | "Fresh Start"-equivalent; OEM pilot | 5 eng + partner work, 6–12 months (OEM-bound) | ~40 EM |
 | **5. Workspace capability and MAM** | T0/T1 work-user lifecycle, user-scope policy, consent, bridge/portals/printing, separate-seat option, multi-tenant isolation and runtime conformance | TRP-Workspace 2.0 (proposed) | Re-estimate required; previous baseline: 6 eng, 6 months | Previous baseline: ~35 EM |
 
@@ -1065,7 +1084,7 @@ These choices come before any code. Each has my recommendation.
 | 7 | **osquery dependency** | Required; optional extension; none | **Optional extension.** Native core facts keep C-PKG-02 achievable. |
 | 8 | **Default signing model** | Server-held keys (easy) vs admin hardware-key signatures (safe) | **Admin signatures required for the high-risk class by default**; server-held is an explicit, labelled opt-out. It's the main thing that makes Tuxherd safer than incumbents. |
 | 9 | **Entra strategy** | Ignore; bridge (custom compliance + Himmelblau); lobby for partner API | **Bridge now, lobby in parallel, but build the native SSF path first.** Don't make Microsoft a dependency. |
-| 10 | **TPM requirement** | Mandatory; tiered | **Tiered:** software keys allowed at `software` trust level (VMs, old hardware); IdPs decide what they need. |
+| 10 | **TPM requirement** | Mandatory; tiered | **Never required (chrono's directive).** Every capability has a software path at `software` trust / `workspace-unattested`. TPM is an optional assurance upgrade (`tpm-key`, `tpm-measured`, measured-host, sealed leases). Tenants may *require* a level; the protocol and profiles never do. |
 | 11 | **Zero-touch base** | FDO; custom claim registry; installer profiles only | **Installer profiles + account-driven for MVP; FDO for Phase 4.** No central registry run by the project. |
 | 12 | **BYOD stance** | Support in v1; defer; never | **Design the capability ceiling and BYOD maximum into TP/1 v1** (cheap, and hard to retrofit), but ship the workspace UX in Phase 5. |
 | 13 | **Hosted service** | Project runs a SaaS; vendors only | **Vendors only.** A project-run SaaS competes with the adopters you need. |
