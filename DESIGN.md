@@ -54,10 +54,18 @@ Every Linux management tool today has its own enrollment, agent and control chan
 5. **The device enforces its own limits.** Each enrollment has a *capability ceiling* agreed at enrollment and stored on the device. No server compromise can exceed it.
 6. **BYOD-respecting.** Personal devices get scoped management, with a published list of what may never be collected. The user can see every query and action locally.
 7. **Offline-tolerant.** Laptops are offline a lot. Policy is evaluated locally, results queue, and lease-based fallbacks need no connectivity.
-8. **Immutable distros are first-class.** Image-based distros (Fedora Atomic/bootc, openSUSE Aeon/MicroOS, Ubuntu Core, NixOS) are a design target, not an afterthought. For update rings they are actually *easier*.
+8. **Immutable tenant-shipped OCI workspaces; immutable hosts first-class.** Tenant-shipped OCI workspace apps ship as signed, digest-pinned images with ephemeral writable app state and encrypted persistent data; the §7.2 and §9.2 delivery models keep their own persistence rules. Image-based hosts (Fedora Atomic/bootc, openSUSE Aeon/MicroOS, Ubuntu Core, NixOS) remain first-class targets; workspace immutability does not imply host integrity. OCI workspaces are an app delivery option alongside §7.2.
 9. **Honest compliance.** A compliance report is a claim by the device. The protocol records *how much* it is attested (software key, TPM key, measured boot), so relying parties can choose the trust level they need.
 
----
+### 2.1 Authority tiers
+
+| Tier | Ownership / tenant authority |
+|---|---|
+| **T0: Unenrolled Workspace** | No device enrollment; manage only the registered workspace's apps, identity, encrypted data and scoped actions. No tenant host agent or host inventory. |
+| **T1: Enrolled BYOD** | `ownership: byod`; allowlisted read-only device posture and workspace-only actions (§8.5). Includes posture-only BYOD without a work user. |
+| **T2: Corporate** | `ownership: corporate`; device management within the agreed capability ceiling. |
+
+These are authority levels, independent of capability and evidence (§5.1). They are unrelated to §6.4's IdP integration paths A/B/C. T0 registration is not TP/1 device enrollment; see the [proposed MAM supplement](docs/workspace-capability-mam.md) for its protocol and privacy limits.
 
 ## 3. Gap analysis
 
@@ -174,6 +182,9 @@ flowchart LR
 | Enrollment service | Authenticates the bootstrap credential (token, OIDC, FDO voucher), drives attestation, binds device to tenant | **[NEW]** logic on proven primitives |
 | Device CA | Issues short-lived device certs via ACME with `device-attest-01` | step-ca (already supports TPM device attestation) |
 | Device directory | Device records, ownership mode, groups, lifecycle state, capability ceiling | Postgres |
+| Workspace registry | T0/T1/T2 workspace instances, registered user/tenant keys and workspace-only ceilings; separate from device enrollment | **[NEW]**, proposed MAM supplement |
+| Workspace key broker / verifier | Bounded instance-volume leases; policy/evidence evaluation; independent instance KEKs wrapped by tenant KMS keys | **[NEW]**, KMS/HSM + signed reference-policy verification |
+| Evidence broker interface | Consented, fixed-verdict host evidence via owner-controlled TRP-Attested broker (A-BRK-01); no arbitrary tenant queries or raw event-log transmission | **[NEW]**, local broker + remote verifier |
 | Policy store | Source of truth for policy; GitOps-friendly YAML; versioned | git + Postgres (Fleet-style GitOps) |
 | Policy compiler | Resolves targeting, rings and conflicts into a per-device *declaration set*; content-addressed | **[NEW]** |
 | Signing service | Signs declaration manifests with *online* delegated keys. High-risk payloads need admin signatures (§10) | KMS/HSM + TUF-style delegation |
@@ -218,6 +229,8 @@ Local state lives at `/var/lib/tuxherd/`:
 | TB5 | Tenant ↔ tenant (multi-tenant SaaS) | Per-tenant CAs, KMS keys, DB row-level isolation | Operator bugs happen |
 | TB6 | Management plane ↔ IdP | SSF over signed SETs; OAuth client credentials | The IdP trusts posture only at the attestation level it requires |
 | TB7 | Firmware/boot ↔ OS | Measured boot, TPM PCRs, sealed keys | Attestation proves the boot chain, not runtime integrity |
+| TB8 | Workspace tenant ↔ host owner | Owner consent, work UID, dedicated-UID display bridge, network floor and verdict-only reports | Host kernel/root and a bridged personal compositor remain trusted for unlocked data |
+| TB9 | Workspace ↔ key broker | Registered-key proof over TLS, signed bounded leases, HPKE key release and scoped revocation | Already released keys/plaintext cannot be recalled; unsealing policy is not runtime integrity |
 
 ### 4.5 The protocol (TP/1) in brief
 
@@ -256,6 +269,8 @@ Encoding: JSON + JWS (RFC 7515) in v1, chosen because it is easy to debug. A CBO
 | `software` | Key on disk. Proves continuity only. |
 | `tpm-key` | Key is TPM-resident; EK chain verified. |
 | `tpm-measured` | As above, plus a quote over PCRs 0, 2, 4, 7 and 11 (and 9/12 where useful) that matches the distro's reference measurements. |
+
+Workspace subjects use a separate `assurance` vocabulary: `workspace-unattested` for self/helper reports, or `workspace-measured-host` for fresh, workspace-key-bound boot evidence accepted against independently trusted references. This is the workspace-subject counterpart of device `trust_level`, not an equivalent or promotion to `tpm-measured`. T1/T2 workspaces report `assurance` independently of their enrolled device's `trust_level`; T0 has no device trust claim. Measurement never proves mutable runtime integrity or increases tenant authority. See the [supplement](docs/workspace-capability-mam.md#capability-and-compliance-signals) for the closed verdict schema and consent rules.
 
 ### 5.2 Bootstrap credentials (what authorises an enrollment)
 
@@ -478,15 +493,15 @@ spec:
 
 ### 6.4 Compliance → access
 
-Compliance only matters if it gates access. There are three integration tiers.
+Compliance only matters if it gates access. There are three integration paths.
 
-| Tier | Mechanism | Status |
+| Path | Mechanism | Status |
 |---|---|---|
 | **A. Native OIDC IdPs** (Keycloak, Okta, Authentik, Ping, Google) | **SSF/CAEP** `device-compliance-change` events pushed to the IdP. At sign-in the IdP checks posture by (a) **mTLS client cert** from the TPM device key, exposed through `tpm2-pkcs11` to browsers via p11-kit/NSS, or (b) a **device posture token**: a short-lived JWS from the management plane, bound to the device key, delivered through a native-messaging browser extension or a D-Bus SSO broker. | (a) proven pattern; (b) **[NEW]** small. Keycloak needs a Tuxherd authenticator SPI (**[NEW]**, small). |
 | **B. Entra ID on Intune-supported distros** (Ubuntu, RHEL) | Run Microsoft's Intune agent *alongside* Tuxherd. Tuxherd publishes a compliance summary that an **Intune custom compliance discovery script** reads, staying within the user-context and 1 MB limits. Intune remains the CA authority. | Works within today's documented features. Fragile: depends on Microsoft not changing script semantics. |
 | **C. Entra on other distros** | Partner with **Himmelblau**: Himmelblau handles Entra join/PRT/Intune enrollment, and Tuxherd provides compliance facts and enforcement. Long term, lobby Microsoft to (1) accept third-party Linux compliance through its device-compliance-partner channel or (2) implement TP/1 server endpoints in Intune itself. | Partnership is realistic; Microsoft cooperation is an open question (§14). |
 
-Entra compatibility is an **adoption path, not a dependency**. The protocol's native posture signal is SSF.
+Entra compatibility is an **adoption path, not a dependency**. The protocol's native posture signal is SSF. T0 workspace subjects MUST NOT become `device-compliance-change` or SSF `device` subjects. They use namespaced workspace events and a non-device complex subject, with a Tuxherd-aware authenticator enforcing workspace-key-bound posture tokens per app/resource/audience. Without that IdP rule a host browser bypasses workspace policy. A registered key is not approved-client attestation; DPoP does not bind bearer SaaS cookies. See the [supplement's IdP rules](docs/workspace-capability-mam.md#idp-and-ssf-enforcement).
 
 ### 6.5 Per-user policy on multi-user systems (hard part)
 
@@ -707,7 +722,11 @@ This is BYOD-safe by default.
 | Managed Flatpak apps (iOS-style managed apps) | Sandbox separates apps from each other, but **host processes of the same UID can read `~/.var/app/`** | Seamless | Partial (app data dir) | Useful *within* the work user; not a boundary on its own |
 | Scoped management only (no separation; manage only work apps and posture) | None | Seamless | No | Acceptable for low-risk tenants as "posture-only BYOD" |
 
+The [proposed MAM supplement](docs/workspace-capability-mam.md) develops the rootless OCI/Wayland option into a dedicated work UID plus filtering bridge under TRP-Workspace 2.0. It remains proposed desktop integration, not a shipped isolation boundary; ordinary Wayland forwarding alone does not meet that contract.
+
 ### 9.2 Recommendation
+
+The separate work-user model below uses a **separate seat session with its own compositor**, reached by fast user switching. It is stronger for display/input than the supplement's bridged model. T0 and T1 may use that proposed bridge for ordinary internal data only when policy accepts personal-compositor compromise risk; on T0, anything above ordinary internal requires the separate seat and an explicit policy, while the supplement's forbidden classes remain excluded entirely. On T1 the same compositor risk applies: the bridge is limited to ordinary internal data, and anything above it requires the separate seat under the enrolled policy; bridging does not inherit separate-seat strength. See the [supplement](docs/workspace-capability-mam.md#purpose-and-limits) for these limits.
 
 **BYOD = "work account on a personal device":**
 1. Enrollment creates a **work user** via `systemd-homed` (LUKS2 home, password/FIDO2 unlock, an identity record carrying `tuxherd.tenant`). Where homed isn't available, a regular user with **fscrypt**-encrypted home is the fallback (weaker metadata protection, still crypto-shreddable).
@@ -744,6 +763,7 @@ TUF-style roles per tenant:
 | `root` | Offline / threshold HSM (e.g. 3-of-5 security officers) | Role keys, admin roster | Rare: key rotation |
 | `admins` | Each admin's **FIDO2/PIV hardware key**; roster signed by `root` | High-risk payloads: `root-full` scripts, wipe/lock, ceiling changes, policy sets marked `privileged` | Every risky action |
 | `policy` | Online KMS | Routine declaration manifests (low-risk resource types) | Day-to-day sync |
+| `lease` | Online KMS-backed delegation under `root` | Workspace key leases (online/offline release envelopes) | Per lease issuance; cannot sign commands |
 | `timestamp` | Online | Freshness, so the server can't replay stale manifests | Constant |
 
 **Risk classes** are fixed per resource type in the spec. For example, `desktop.screenlock` is low risk; `sudo`, `pam.policy` and `script:root-full` are high risk. Devices refuse high-risk payloads that aren't signed by the required number of admin keys. Tenants set thresholds (e.g. two admins for wipe on more than 10 devices).
@@ -790,6 +810,9 @@ Enforcement:
 | Supply-chain attack on agent | Distro packaging, reproducible builds, sigstore attestations, small core | Classic distro trust |
 | Downgrade of policy or agent | TUF timestamps/versions; agent minimum version in management declaration | — |
 | Enrollment token theft | Short-lived, count-limited, IP/ASN-scoped tokens; TPM attestation required for corporate trust level | Rogue enrollment of a VM with swtpm → caught by requiring EK chain to a hardware TPM vendor CA |
+| Personal-session compositor compromise | Dedicated bridge UID, default-deny protocols, FIDO2 presence unlock; separate seat recommended and required above ordinary internal on T0 | Bridged pixels/input exposed; captured sudo/polkit credentials can lead to root. Separate seat still shares the kernel. |
+| Tenant code surveys personal LAN/host | Owner-controlled LAN/link-local/loopback floor, `/sys` and `/proc` masking, brokered devices, verdict-only reporting | Owner exceptions weaken protection; shared kernel/permitted traffic retain fingerprinting and covert-channel risk. |
+| Device tenant vs. co-resident workspace tenant | Local-only workspace allowlist; consented anonymous host-authority signal; encrypted locked volumes | Root core compromise or T2 root authority exposes unlocked co-resident data; measured boot does not remove this TCB. |
 
 ---
 
@@ -803,7 +826,9 @@ Enforcement:
 | **TRP-Attested 1.0** | Hardware-backed identity, FDE + escrow, measured boot, strong lock/wipe | Core |
 | **TRP-Desktop 1.0** | Desktop settings, screen lock, browser policy, NM, first-boot enrollment UI | Core |
 | **TRP-Immutable 1.0** | Image-based distros: digest rings, sysext agent, confext | Core |
-| **TRP-Workspace 1.0** | BYOD work-user separation | Desktop + `systemd-homed` |
+| **TRP-Workspace 2.0** (proposed) | Workspace UID/lifecycle, bridge, portals, print/network privacy boundary and runtime ABI tests | Core packaging/OS-release items only (C-PKG-01–03, C-OSR-01–02); no Desktop or enrolled-agent dependency |
+
+**Supersession:** the [proposed MAM supplement](docs/workspace-capability-mam.md#trp-workspace-20) replaces the former TRP-Workspace definition (Desktop + homed) with **TRP-Workspace 2.0**. Homed is SHOULD, with fscrypt allowed at reduced assurance; relaxing W-HOM-01's MUST improves distro adoptability. TRP-Core is release conformance, not enrollment. The optional TPM/evidence broker belongs to TRP-Attested (A-BRK-01), not this workspace profile. Static release conformance remains distinct from per-host runtime verdicts; capability requirements at unattested assurance are configuration gates against mistakes, not controls against a dishonest owner.
 
 Versioning:
 - semantic versions; profiles are independent;
@@ -877,6 +902,11 @@ TRP-ATTESTED-1.0
   A-BOOT-02 MUST publish reference measurements for every shipped kernel/boot-chain
             artefact: either signed PCR 11 policies (UKI + systemd-measure) or
             systemd-pcrlock policy files, at a stable URL listed in conformance.json.
+  A-BRK-01  (Proposed 1.1 addition) SHOULD provide an owner-controlled, consent-gated
+            workspace TPM broker: create, certify, quote, seal/unseal and counters.
+            No raw TPM access for work UIDs. Default budget: two 8-byte NV counters
+            per (human, tenant); exhaustion denies hardware-backed offline
+            capability. See MAM supplement.
   A-WIPE-01 SHOULD ship a signed "tuxherd-recovery" UKI (or boot entry) capable of
             NVMe sanitize / ATA secure erase, TPM PPI clear request, and FDO re-onboarding.
 
@@ -897,10 +927,13 @@ TRP-IMMUTABLE-1.0
   I-ETC-01  /etc MUST be writable and preserved across image updates (3-way merge or overlay).
   I-APP-01  MUST support Flatpak with tenant-configurable remotes.
 
-TRP-WORKSPACE-1.0
-  W-HOM-01  MUST ship systemd-homed with LUKS2 backend enabled and supported by the
-            default display manager.
-  W-HOM-02  homed home locking on suspend MUST be supported by the default DE.
+TRP-WORKSPACE-2.0 (proposed; supersedes the 1.0 workspace checklist)
+  W-HOM-01  SHOULD use systemd-homed with LUKS2; fscrypt fallback permitted at reduced
+            assurance for distro adoptability. MUST support the chosen activation path.
+  W-HOM-02  MUST lock affected workspace volumes on suspend, controlling-session lock/logout,
+            idle timeout and lease expiry; preserve unaffected sibling instances.
+  W-ABI-01  MUST pass the versioned runtime/denied-flow contract in the MAM supplement;
+            declare supported compositor/portal/runtime combinations per release.
 ```
 
 ### 11.3 Sample enrollment profile (as placed by the installer)
@@ -972,7 +1005,9 @@ Estimates assume a core team of experienced Rust/Go/systems engineers; "EM" = en
 | **2. Configuration & software** | Core resource catalog (§7.1) with apply/observe/remove + rollback; software abstraction (AppStream/native/Flatpak); repos; rings (digest/snapshot/deferral); LAPS; FDE enforce + escrow; admin signature model (TUF roles); transparency log | TRP-Core 1.0 final, TRP-Desktop 1.0, TRP-Immutable 1.0 (Fedora Atomic/bootc, openSUSE Aeon) | 9 eng, 6–8 months | ~65 EM |
 | **3. Remote actions** | Lock tiers incl. TPM-slot device lock; lease lock; retire; wipe tiers through `crypto-erase`; multi-party approvals; wipe receipts; recovery UKI prototype | TRP-Attested 1.0 (measured boot, reference measurements with ≥ 2 distros) | 8 eng, 6 months | ~45 EM |
 | **4. Zero-touch** | FDO integration (client in the installer/first boot, rendezvous, voucher import UI); `sanitize` wipe + re-provision; first OEM pilot (most realistic: System76, Framework, Lenovo/Dell Linux SKUs) | "Fresh Start"-equivalent; OEM pilot | 5 eng + partner work, 6–12 months (OEM-bound) | ~40 EM |
-| **5. BYOD separation** | homed work-user provisioning, user-scope declarations, per-user compliance, BYOD consent UI, privacy allowlist tests, `pam_tuxherd` | TRP-Workspace 1.0 | 6 eng, 6 months | ~35 EM |
+| **5. Workspace capability and MAM** | T0/T1 work-user lifecycle, user-scope policy, consent, bridge/portals/printing, separate-seat option, multi-tenant isolation and runtime conformance | TRP-Workspace 2.0 (proposed) | Re-estimate required; previous baseline: 6 eng, 6 months | Previous baseline: ~35 EM |
+
+The [MAM supplement](docs/workspace-capability-mam.md#roadmap-impact-and-decisions) proposes a Phase 2b **public/low-risk SaaS-only** Fedora browser pilot; ordinary internal mail/cache waits for UID and managed display/print boundaries. Phase 3 adds the TRP-Attested broker; measured-host leases require validated sealed UKI/composefs binding and independent references. The following base total excludes this added desktop/broker/distro scope and needs re-estimation.
 
 **Total to "feature-comparable with Intune on Windows for the core 80%":** about 250 EM, roughly 24–30 months with a core of 8–12 engineers, plus distro packaging done by distro maintainers (estimate 1–3 EM per distro per profile). Phases 2 and 5 can overlap partly; Phase 4's timeline is set by OEMs, not code.
 
@@ -994,7 +1029,7 @@ Estimates assume a core team of experienced Rust/Go/systems engineers; "EM" = en
 | **Attestation brittleness:** PCR values change on every kernel/firmware update | False noncompliance, angry users | Use signed policies (PCR 11 via UKI + systemd-measure; pcrlock), not raw PCR values; attestation is a trust *level*, not pass/fail, unless the tenant opts in |
 | **osquery packaging:** not in most distro main repos (vendored build) | C-PKG-02 conflict | osquery is optional in TP/1; core facts are native. Fund osquery packaging separately. |
 | **Desktop diversity** (GNOME, KDE, others; X11 vs Wayland) | Settings coverage gaps | TRP-Desktop requires only the *default* DE to conform; others are best effort |
-| **Microsoft indifference or hostility** (Entra CA stays closed to third-party Linux compliance) | Slower adoption in M365 shops | Tier B/C bridges; native IdP path; public-sector pressure |
+| **Microsoft indifference or hostility** (Entra CA stays closed to third-party Linux compliance) | Slower adoption in M365 shops | Paths B/C; native IdP path; public-sector pressure |
 | **Legal/privacy:** works councils (DE), GDPR on telemetry | Blocked deployments | BYOD maximum + transparency view are features for works councils; publish a DPIA template |
 | **Root-compromise reality:** posture can be forged | Overselling | Document plainly; attestation levels in every signal |
 
@@ -1036,3 +1071,8 @@ These choices come before any code. Each has my recommendation.
 | 14 | **Licensing** | Apache-2.0 vs GPL/AGPL for agent and server | **Apache-2.0** for code, **CSL/OWFa** for spec. Adoption by commercial vendors matters more than copyleft here. |
 | 15 | **Name and trademark** | name chosen: **Tuxherd** (2026-10-26) | Do a trademark search before Phase 0 ends; the foundation must own the mark, since "Tuxherd Ready" certification depends on it. |
 | 16 | **Funding for Phase 0–1** | Self-funded; public-sector grant; vendor consortium | **Public-sector co-funding plus 1–2 vendor sponsors.** About 70 EM is too much to self-fund and too early for a large consortium. |
+| 17 | **MAM stance** | Require device enrollment; permit scoped MAM-WE | **Permit T0 MAM-WE**, with workspace-only authority and honest loss/offboarding/mistake protection; forbidden high-risk resources remain excluded. |
+| 18 | **On-device tenants** | One tenant total; multiple workspace tenants | **Multiple isolated resource tenants, at most one device tenant.** Enforce workspace allowlists locally without revealing other employers; disclose anonymous host authority with consent. |
+| 19 | **Multi-identity scope** | Multiple resource tenants in one app; one per workspace | **One resource tenant per app/workspace in v1.** Multiple definitions per (human, tenant) are allowed; cross-tenant identity sharing is deferred. |
+| 20 | **Where DLP is enforced** | Local-only controls; combined remote and local gates | **IdP token/audience rules and key-broker leases gate access; workspace mediates cooperative flows.** No screenshot/input guarantee against a compromised compositor or host. |
+| 21 | **Assurance axis vs tier** | Enrollment implies trust; independent axes | **Authority tier ≠ capability ≠ evidence.** Workspace `assurance` and device `trust_level` remain separate; measurement never raises T0 authority or live-data ceiling. |

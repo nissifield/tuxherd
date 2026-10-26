@@ -18,6 +18,8 @@ Architecture proposal, draft 0.1 (2026-10-26). No code yet.
 
 **[DESIGN.md](DESIGN.md)** — the full architecture document: gap analysis vs Intune-on-Linux, TPM-backed enrollment, declarative policy model, remote actions with BYOD safeguards, the distro conformance checklist, threat model, phased roadmap, and the open decision list.
 
+**[Workspace Capability and MAM](docs/workspace-capability-mam.md)** (proposed supplement) — unenrolled workspaces, distro capabilities, tenant isolation and assurance limits.
+
 ## License
 
 Documentation and specification: [CC-BY-4.0](LICENSE).
